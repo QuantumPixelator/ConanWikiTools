@@ -118,7 +118,7 @@ Thumbs.db
 
 # Project specific
 # SQLite database (if regenerated)
-thralls.db
+# thralls.db  ##### Uncomment if you want to ignore the database file. It is included by default.
 
 # Scraped data files (if not wanted in repo)
 scraped_data/

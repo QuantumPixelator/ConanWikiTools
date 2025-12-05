@@ -2,6 +2,8 @@
 
 A unified desktop application for scraping, formatting, and viewing Conan Exiles wiki data, specifically focused on thrall information.
 
+![Application Screenshot](screenshot.png)
+
 ## Features
 
 - **Wiki Scraper**: Downloads all pages from the Conan Exiles Fandom wiki using the MediaWiki API
