@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import requests
+import time
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QProgressBar, QFileDialog, QComboBox,
@@ -73,6 +74,7 @@ class ScraperTab(QWidget):
         self.progress_bar.setValue(0)
 
         self.scrape_button = QPushButton("Start Scraping")
+        self.scrape_button.setToolTip("Select a folder and start scraping wiki pages for thralls, NPCs, creatures, and pets")
         self.scrape_button.clicked.connect(self.toggle_scraping)
 
         layout.addWidget(self.label)
@@ -141,6 +143,20 @@ class ScrapeWorker(QThread):
         self.is_paused = False
         self.pause_condition = QWaitCondition()
         self.mutex = QMutex()
+        self.progress_file = os.path.join(save_dir, "scraping_progress.txt")
+        self.scraped_pages = self.load_progress()
+
+    def load_progress(self):
+        if os.path.exists(self.progress_file):
+            with open(self.progress_file, 'r', encoding='utf-8') as f:
+                return set(line.strip() for line in f)
+        return set()
+
+    def save_progress(self, page_title):
+        self.scraped_pages.add(page_title)
+        with open(self.progress_file, 'w', encoding='utf-8') as f:
+            for page in self.scraped_pages:
+                f.write(page + '\n')
 
     def pause(self):
         self.mutex.lock()
@@ -156,6 +172,25 @@ class ScrapeWorker(QThread):
     def sanitize_filename(self, title):
         return re.sub(r'[<>:"/\\|?*]', '_', title)
 
+    def retry_request(self, url, params=None, max_retries=3, backoff_factor=2):
+        """Retry a request with exponential backoff."""
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, params=params, timeout=30)
+                if response.status_code == 200:
+                    return response
+                else:
+                    self.status_update.emit(f"HTTP {response.status_code} for {url}, attempt {attempt + 1}")
+            except requests.RequestException as e:
+                self.status_update.emit(f"Request failed for {url}, attempt {attempt + 1}: {e}")
+            
+            if attempt < max_retries - 1:
+                sleep_time = backoff_factor ** attempt
+                self.status_update.emit(f"Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+        
+        raise requests.RequestException(f"Failed to fetch {url} after {max_retries} attempts")
+
     def fetch_all_pages(self):
         all_pages = set()
         categories = ["Thralls", "NPCs", "Creatures", "Pets"]
@@ -168,8 +203,8 @@ class ScrapeWorker(QThread):
                 "cmlimit": "max"
             }
             while True:
-                response = requests.get("https://conanexiles.fandom.com/api.php", params=params)
-                if response.status_code == 200:
+                try:
+                    response = self.retry_request("https://conanexiles.fandom.com/api.php", params=params)
                     data = response.json()
                     pages = data['query']['categorymembers']
                     for page in pages:
@@ -178,7 +213,8 @@ class ScrapeWorker(QThread):
                         params['cmcontinue'] = data['continue']['cmcontinue']
                     else:
                         break
-                else:
+                except requests.RequestException as e:
+                    self.status_update.emit(f"Failed to fetch category {category}: {e}")
                     break
         return list(all_pages)
 
@@ -190,12 +226,14 @@ class ScrapeWorker(QThread):
             "titles": page_title,
             "rvprop": "content"
         }
-        response = requests.get("https://conanexiles.fandom.com/api.php", params=params)
-        if response.status_code == 200:
+        try:
+            response = self.retry_request("https://conanexiles.fandom.com/api.php", params=params)
             data = response.json()
             pages = data['query']['pages']
             for page_id, page_info in pages.items():
                 return page_info['revisions'][0]['*'] if 'revisions' in page_info else None
+        except requests.RequestException as e:
+            self.status_update.emit(f"Failed to fetch content for {page_title}: {e}")
         return None
 
     def save_page(self, content, page_title):
@@ -209,25 +247,23 @@ class ScrapeWorker(QThread):
         pages = self.fetch_all_pages()
         if pages:
             self.total_pages = len(pages)
-            self.status_update.emit(f"Found {self.total_pages} pages. Starting to download content...")
+            self.pages_scraped = len(self.scraped_pages)
+            self.status_update.emit(f"Found {self.total_pages} pages. {self.pages_scraped} already scraped.")
             for i, page_title in enumerate(pages):
                 self.mutex.lock()
                 while self.is_paused:
                     self.pause_condition.wait(self.mutex)
                 self.mutex.unlock()
-                page_title_cleaned = self.sanitize_filename(page_title)
-                file_path = os.path.join(self.save_dir, f"{page_title_cleaned}.txt")
-                if os.path.exists(file_path):
-                    self.status_update.emit(f"Skipping already downloaded: {page_title}")
-                    self.pages_scraped += 1
+                if page_title in self.scraped_pages:
                     continue
                 self.status_update.emit(f"Downloading: {page_title}")
                 content = self.fetch_page_content(page_title)
                 if content:
                     self.save_page(content, page_title)
+                    self.save_progress(page_title)
+                    self.pages_scraped += 1
                 else:
                     self.status_update.emit(f"Failed to fetch content for {page_title}")
-                self.pages_scraped += 1
                 self.progress.emit(int((self.pages_scraped / self.total_pages) * 100))
             self.status_update.emit("Scraping completed!")
             self.scraping_complete.emit()
@@ -334,12 +370,16 @@ class FormatterTab(QWidget):
 
         button_layout = QHBoxLayout()
         self.select_files_btn = QPushButton("Select Input Files")
+        self.select_files_btn.setToolTip("Choose the scraped wiki text files to process")
         self.select_files_btn.clicked.connect(self.select_input_files)
         self.select_folder_btn = QPushButton("Select Output Folder")
+        self.select_folder_btn.setToolTip("Choose where to save the formatted data files")
         self.select_folder_btn.clicked.connect(self.select_output_folder)
         self.start_btn = QPushButton("Start Processing")
+        self.start_btn.setToolTip("Begin formatting the selected files")
         self.start_btn.clicked.connect(self.start_processing)
         self.stop_btn = QPushButton("Stop Processing")
+        self.stop_btn.setToolTip("Stop the current processing operation")
         self.stop_btn.clicked.connect(self.stop_processing)
         button_layout.addWidget(self.select_files_btn)
         button_layout.addWidget(self.select_folder_btn)
@@ -464,6 +504,7 @@ class FileProcessorThread(QThread):
             data['notes'] = notes_cleaned.replace("{{PAGENAME}}", data['name']).replace("'''", "")
             if "(pet)" in file_name.lower():
                 data['class'] = 'pet'
+                data['description'] = f"{data['name']} is a loyal pet companion."
             output = [
                 f"Name = {data['name']}",
                 f"ID = {data['id']}",
@@ -579,7 +620,7 @@ class PopulateWorker(QThread):
             try:
                 thrall_data = self.parse_thrall_file(file_path)
                 result = self.insert_or_update_data(thrall_data)
-                if "INVALID CLASS" in result:
+                if "INVALID" in result:
                     self.status_update.emit(f"<b style='color:red;'>{file_name}: {result}</b>")
                 else:
                     self.status_update.emit(f"<b>{file_name}: {result}</b>")
@@ -601,6 +642,14 @@ class PopulateWorker(QThread):
         conn = sqlite3.connect("thralls.db")
         cursor = conn.cursor()
         thrall_class = data.get("class", "").lower()
+        
+        # Data validation
+        required_fields = ['name', 'id', 'class']
+        for field in required_fields:
+            if not data.get(field) or data[field] == 'N/A':
+                conn.close()
+                return f"INVALID DATA: Missing or invalid {field.upper()}"
+        
         if thrall_class not in [
             "alchemist", "archer", "armorer", "bearer", "blacksmith",
             "carpenter", "cook", "fighter", "performer", "priest",
@@ -664,6 +713,7 @@ class DBViewerTab(QWidget):
         self.header_label = QLabel("<b>Choose Category:</b>")
         self.header_label.setAlignment(Qt.AlignLeft)
         self.table_dropdown = QComboBox()
+        self.table_dropdown.setToolTip("Select the category of thralls to view")
         self.table_dropdown.addItems([
             "All", "Alchemist", "Archer", "Armorer", "Bearer", "Blacksmith",
             "Carpenter", "Cook", "Fighter", "Performer", "Priest",
@@ -675,6 +725,7 @@ class DBViewerTab(QWidget):
         self.search_field = QLineEdit()
         self.search_field.setPlaceholderText("Enter search conditions (e.g., Gender=female AND Level Rate=fast)")
         self.search_button = QPushButton("Search")
+        self.search_button.setToolTip("Search thralls using conditions like Gender=female AND Class=fighter")
         self.search_button.clicked.connect(self.perform_search)
         self.search_layout.addWidget(self.search_field)
         self.search_layout.addWidget(self.search_button)
@@ -837,8 +888,18 @@ class DBPopulatorTab(QWidget):
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setFont(QFont("Arial", 18, QFont.Bold))
 
+        button_layout = QHBoxLayout()
         self.load_button = QPushButton("Load Thrall Files")
+        self.load_button.setToolTip("Select formatted data files to populate the database")
         self.load_button.clicked.connect(self.load_files)
+        
+        self.purge_button = QPushButton("Purge Database")
+        self.purge_button.setToolTip("Clear all records from the database (irreversible)")
+        self.purge_button.setStyleSheet("QPushButton { color: red; }")
+        self.purge_button.clicked.connect(self.purge_database)
+        
+        button_layout.addWidget(self.load_button)
+        button_layout.addWidget(self.purge_button)
 
         self.progress = QProgressBar()
 
@@ -846,7 +907,7 @@ class DBPopulatorTab(QWidget):
         self.log.setReadOnly(True)
 
         layout.addWidget(self.label)
-        layout.addWidget(self.load_button)
+        layout.addLayout(button_layout)
         layout.addWidget(self.progress)
         layout.addWidget(self.log)
 
@@ -870,6 +931,34 @@ class DBPopulatorTab(QWidget):
         self.log.append("Processing Complete")
         self.load_button.setEnabled(True)
 
+    def purge_database(self):
+        reply = QMessageBox.question(
+            self, 'Confirm Purge',
+            'This will permanently delete ALL records from the database.\n\nAre you sure you want to continue?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                conn = sqlite3.connect("thralls.db")
+                cursor = conn.cursor()
+                classes = [
+                    "Alchemist", "Archer", "Armorer", "Bearer", "Blacksmith",
+                    "Carpenter", "Cook", "Fighter", "Performer", "Priest",
+                    "Smelter", "Sorcerer", "Tanner", "Taskmaster", "Pets", "Animals", "NPCs"
+                ]
+                for table in classes:
+                    cursor.execute(f"DELETE FROM {table}")
+                    self.log.append(f"Purged {cursor.rowcount} records from {table}")
+                conn.commit()
+                conn.close()
+                self.log.append("Database purge completed successfully")
+            except Exception as e:
+                self.log.append(f"Error during purge: {e}")
+        else:
+            self.log.append("Purge cancelled")
+
     def parse_thrall_file(self, file_path):
         data = {}
         with open(file_path, "r", encoding='utf-8') as file:
@@ -883,6 +972,14 @@ class DBPopulatorTab(QWidget):
         conn = sqlite3.connect("thralls.db")
         cursor = conn.cursor()
         thrall_class = data.get("class", "").lower()
+        
+        # Data validation
+        required_fields = ['name', 'id', 'class']
+        for field in required_fields:
+            if not data.get(field) or data[field] == 'N/A':
+                conn.close()
+                return f"INVALID DATA: Missing or invalid {field.upper()}"
+        
         if thrall_class not in [
             "alchemist", "archer", "armorer", "bearer", "blacksmith",
             "carpenter", "cook", "fighter", "performer", "priest",
@@ -974,8 +1071,16 @@ def initialize_database():
 class ConanWikiToolsApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Conan Exiles Wiki Tools")
+        self.setWindowTitle("Conan Exiles Wiki Tools v1.0")
         self.setGeometry(100, 100, 1200, 800)
+
+        # Menu bar
+        menubar = self.menuBar()
+        help_menu = menubar.addMenu('Help')
+        about_action = help_menu.addAction('About')
+        about_action.triggered.connect(self.show_about)
+        check_updates_action = help_menu.addAction('Check for Wiki Changes')
+        check_updates_action.triggered.connect(self.check_wiki_changes)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(ScraperTab(), "Scraper")
@@ -986,6 +1091,27 @@ class ConanWikiToolsApp(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         self.setStyleSheet(CONAN_STYLE)
+
+    def show_about(self):
+        QMessageBox.about(self, "About", "Conan Exiles Wiki Tools v1.0\n\nA tool to scrape, format, and manage Conan Exiles wiki data for thralls, NPCs, creatures, and pets.\n\nFeatures:\n- Wiki scraping with progress persistence\n- Data formatting and validation\n- Database population with error recovery\n- Searchable database viewer\n\n Developed by Quantum Pixelator.")
+
+    def check_wiki_changes(self):
+        # Simple check: try to fetch a known page and see if infobox is present
+        try:
+            response = requests.get("https://conanexiles.fandom.com/api.php?action=query&prop=revisions&titles=Archer&rvprop=content&format=json", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                pages = data['query']['pages']
+                for page_id, page_info in pages.items():
+                    content = page_info.get('revisions', [{}])[0].get('*', '')
+                    if '{{Thrall infobox' in content:
+                        QMessageBox.information(self, "Wiki Check", "Wiki template appears unchanged.")
+                    else:
+                        QMessageBox.warning(self, "Wiki Check", "Wiki template may have changed. Please check manually.")
+                    return
+            QMessageBox.warning(self, "Wiki Check", "Failed to check wiki. Network error.")
+        except Exception as e:
+            QMessageBox.warning(self, "Wiki Check", f"Error checking wiki: {e}")
 
 if __name__ == "__main__":
     initialize_database()
